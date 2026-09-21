@@ -10,17 +10,21 @@
   h1 { font-size:1.4rem; margin:0 0 8px; }
   p  { color:#9aa0a6; font-size:.9rem; line-height:1.5; }
   button { font-size:1.1rem; padding:14px 32px; border:0; border-radius:999px; cursor:pointer; background:#2e7d32; color:white; margin:18px 0; }
+  button:disabled { opacity:.6; cursor:default; }
   button.stop { background:#c62828; }
   #status { font-size:1rem; min-height:1.5em; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#555; margin-right:8px; }
-  .listening .dot { background:#43a047; } .speaking .dot { background:#1e88e5; }
+  .listening .dot { background:#43a047; }
+  .speaking .dot { background:#1e88e5; }
+  .user .dot { background:#f9a825; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Talk to the voice agent</h1>
-  <p>Uses your microphone and speakers. <b>Wear headphones</b> so the agent doesn't hear itself and interrupt.
-     Speak naturally; you can interrupt it mid-sentence.</p>
+  <p>Uses your microphone and speakers. <b>Wear headphones</b>.
+     The mic is gated while the agent is talking so it does not hear itself.
+     Speak clearly if you want to interrupt.</p>
   <button id="btn">Start call</button>
   <div id="status"><span class="dot"></span><span id="statusText">Idle</span></div>
 </div>
@@ -51,8 +55,42 @@ const statusEl = document.getElementById("status");
 const statusText = document.getElementById("statusText");
 let ws = null, ctx = null, stream = null, node = null;
 let nextTime = 0, sources = [], speakingTimer = null;
+let live = false, userTalkingUntil = 0;
 
-function setStatus(text, cls) { statusText.textContent = text; statusEl.className = cls || ""; }
+function setStatus(text, cls) {
+  statusText.textContent = text;
+  statusEl.className = cls || "";
+}
+
+function isPlaying() {
+  if (!ctx) return false;
+  return sources.length > 0 || nextTime > ctx.currentTime + 0.08;
+}
+
+function rms(samples) {
+  let s = 0;
+  for (let i = 0; i < samples.length; i++) s += samples[i] * samples[i];
+  return Math.sqrt(s / Math.max(1, samples.length));
+}
+
+function refreshStatus() {
+  if (!live) return;
+  if (isPlaying()) setStatus("Agent speaking", "speaking");
+  else if (performance.now() < userTalkingUntil) setStatus("You are talking", "user");
+  else setStatus("Listening — your turn", "listening");
+}
+
+function idleButton() {
+  btn.textContent = "Start call";
+  btn.className = "";
+  btn.disabled = false;
+}
+
+function inCallButton() {
+  btn.textContent = "End call";
+  btn.className = "stop";
+  btn.disabled = false;
+}
 
 // ---- playback: queue agent audio back-to-back; "clear" (barge-in) stops everything queued
 function playMulaw(bytes) {
@@ -66,17 +104,17 @@ function playMulaw(bytes) {
   src.start(t);
   nextTime = t + buf.duration;
   sources.push(src);
-  src.onended = () => { sources = sources.filter(s => s !== src); };
-  setStatus("Agent speaking", "speaking");
+  src.onended = () => { sources = sources.filter(s => s !== src); refreshStatus(); };
+  refreshStatus();
   clearTimeout(speakingTimer);
-  speakingTimer = setTimeout(() => setStatus("Listening...", "listening"),
+  speakingTimer = setTimeout(refreshStatus,
                              Math.max(0, (nextTime - ctx.currentTime) * 1000) + 200);
 }
 function clearPlayback() {
   sources.forEach(s => { try { s.stop(); } catch (e) {} });
   sources = [];
   nextTime = 0;
-  setStatus("Listening...", "listening");
+  refreshStatus();
 }
 
 // ---- capture: microphone -> 8 kHz float samples -> 20 ms mu-law frames -> websocket
@@ -97,12 +135,16 @@ async function start() {
   ctx.createMediaStreamSource(stream).connect(node);
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
+  live = true;
+  inCallButton();
   ws = new WebSocket(`${proto}://${location.host}/media`);
   ws.onopen = () => {
+    if (!live) return;
     ws.send(JSON.stringify({ event: "start", start: { streamSid: "MZweb", callSid: "CAweb" } }));
     setStatus("Connected, waiting for greeting...", "listening");
   };
   ws.onmessage = (e) => {
+    if (!live) return;
     const m = JSON.parse(e.data);
     if (m.event === "media") {
       const bin = atob(m.media.payload);
@@ -113,41 +155,62 @@ async function start() {
       clearPlayback();
     }
   };
-  ws.onclose = () => { if (ctx) stop(); };
+  ws.onclose = () => { if (live) stop("Call ended."); };
+  ws.onerror = () => { if (live) stop("Connection error."); };
 
   let pending = [];
   node.port.onmessage = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    for (const f of e.data) {
+    if (!live || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const samples = e.data;
+    const energy = rms(samples);
+    if (energy > 0.04) userTalkingUntil = performance.now() + 400;
+    refreshStatus();
+    const mute = isPlaying() && energy < 0.09;
+    for (const f of samples) {
       const s = Math.max(-1, Math.min(1, f));
-      pending.push(linearToMulaw(Math.round(s * 32767)));
+      pending.push(mute ? 0xFF : linearToMulaw(Math.round(s * 32767)));
     }
-    while (pending.length >= 160) {           // 160 samples = 20 ms at 8 kHz
+    while (pending.length >= 160) {
       const frame = pending.splice(0, 160);
       ws.send(JSON.stringify({ event: "media", media: { payload: btoa(String.fromCharCode(...frame)) } }));
     }
   };
 
-  btn.textContent = "End call";
-  btn.className = "stop";
+  // handlers attached
 }
 
-function stop() {
-  try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "stop" })); } catch (e) {}
-  try { ws && ws.close(); } catch (e) {}
-  clearPlayback();
-  if (stream) stream.getTracks().forEach(t => t.stop());
-  if (ctx) ctx.close();
-  ws = ctx = stream = node = null;
-  btn.textContent = "Start call";
-  btn.className = "";
-  setStatus("Call ended. Transcript saved in data/transcripts.", "");
+function stop(endedText) {
+  live = false;
+  idleButton();
+  setStatus(endedText || "Call ended.", "");
+  clearTimeout(speakingTimer);
+  const socket = ws;
+  ws = null;
+  try {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ event: "stop" }));
+    }
+  } catch (e) {}
+  try { if (socket) socket.close(); } catch (e) {}
+  try { clearPlayback(); } catch (e) {}
+  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  stream = null;
+  try { if (ctx && ctx.state !== "closed") ctx.close(); } catch (e) {}
+  ctx = null;
+  node = null;
+  sources = [];
+  nextTime = 0;
+  userTalkingUntil = 0;
 }
 
 btn.onclick = async () => {
-  if (ws) { stop(); return; }
+  if (live) { stop(); return; }
+  btn.disabled = true;
   try { await start(); }
-  catch (err) { console.error(err); stop(); setStatus("Error: " + err.message, ""); }
+  catch (err) {
+    console.error(err);
+    stop("Error: " + err.message);
+  }
 };
 </script>
 </body>

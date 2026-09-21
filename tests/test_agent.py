@@ -211,6 +211,50 @@ def test_barge_in_cancels_reply_and_sends_clear(m):
     asyncio.run(scenario())
 
 
+def test_vad_does_not_cut_agent_while_audio_is_queued(m):
+    """SpeechStarted during TTS playback is usually echo; do not stop the agent."""
+    async def scenario():
+        ws = FakeWS()
+        call = m.Call(ws)
+        call.stream_sid = "MZ1"
+        call.latency_logged = True
+        call._audio_tail = 3.0
+        call._audio_t = __import__("time").perf_counter()
+        call.task = asyncio.create_task(asyncio.sleep(30))
+        await asyncio.sleep(0)
+
+        async def fake_dg():
+            yield json.dumps({"type": "SpeechStarted"})
+
+        await call.deepgram_loop(fake_dg())
+        assert not call.task.done()
+        assert {"event": "clear", "streamSid": "MZ1"} not in ws.sent
+
+    asyncio.run(scenario())
+
+
+def test_real_words_still_barge_in_while_agent_is_speaking(m):
+    async def scenario():
+        ws = FakeWS()
+        call = m.Call(ws)
+        call.stream_sid = "MZ1"
+        call.latency_logged = True
+        call._audio_tail = 3.0
+        call._audio_t = __import__("time").perf_counter()
+        call.task = asyncio.create_task(asyncio.sleep(30))
+        await asyncio.sleep(0)
+
+        async def fake_dg():
+            yield json.dumps({"type": "Results", "is_final": False, "speech_final": False,
+                              "channel": {"alternatives": [{"transcript": "wait"}]}})
+
+        await call.deepgram_loop(fake_dg())
+        assert call.task.cancelled()
+        assert {"event": "clear", "streamSid": "MZ1"} in ws.sent
+
+    asyncio.run(scenario())
+
+
 def test_deepgram_events_drive_turns(m, monkeypatch):
     replies = []
 

@@ -161,6 +161,8 @@ class Call:
         self.turn_sentences = 0    # sentences queued for speech this turn (0 => the agent would be silent)
         self.latency_logged = True
         self.http = httpx.AsyncClient(timeout=30)
+        self._audio_tail = 0.0
+        self._audio_t = time.perf_counter()
 
     # ---- output to Twilio
     async def send_json(self, obj):
@@ -169,8 +171,15 @@ class Call:
     async def send_audio(self, audio: bytes):
         if not self.latency_logged and self.turn_end_ts:
             self.log_latency()
+        now = time.perf_counter()
+        self._audio_tail = max(0.0, self._audio_tail - (now - self._audio_t)) + len(audio) / 8000
+        self._audio_t = now
         await self.send_json({"event": "media", "streamSid": self.stream_sid,
                               "media": {"payload": base64.b64encode(audio).decode()}})
+
+    def playback_left(self):
+        """Seconds of agent audio already sent that the client may still be playing."""
+        return max(0.0, self._audio_tail - (time.perf_counter() - self._audio_t))
 
     def log_latency(self):
         """Time from Deepgram's end-of-turn signal to the first audio byte we send to Twilio."""
@@ -319,6 +328,8 @@ class Call:
         if self.task and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        self._audio_tail = 0.0
+        self._audio_t = time.perf_counter()
         # always clear: Twilio may still be *playing* audio even after we finished sending it
         await self.send_json({"event": "clear", "streamSid": self.stream_sid})
 
@@ -346,11 +357,19 @@ class Call:
                 m = json.loads(raw)
                 kind = m.get("type")
                 if kind == "SpeechStarted":
+                    # VAD alone is too jumpy (echo, breath, keyboard). Only cut playback
+                    # when the agent is idle-or-done sending, not while TTS is still queued.
+                    if self.playback_left() > 0.2:
+                        continue
                     await self.interrupt()
                 elif kind == "Results":
                     alt = m["channel"]["alternatives"][0]
-                    if m.get("is_final") and alt["transcript"].strip():
-                        self.parts.append(alt["transcript"].strip())
+                    heard = (alt.get("transcript") or "").strip()
+                    # Real words while we are speaking: barge-in even if audio is still queued.
+                    if heard and self.task and not self.task.done() and self.latency_logged:
+                        await self.interrupt()
+                    if m.get("is_final") and heard:
+                        self.parts.append(heard)
                     if m.get("speech_final"):
                         self.flush_turn()
                 elif kind == "UtteranceEnd":  # fallback if speech_final never fired
