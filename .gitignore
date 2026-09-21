@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+bookings.db
+latency.csv
+transcripts/
+test.mp3
+
+# runtime files after the data/ layout change
+data/bookings.db
+data/latency.csv
+data/transcripts/
+data/test.mp3
+data/*
+!data/.gitkeep

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Agent - browser call</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#0f1115; color:#e8e8e8; display:flex; min-height:100vh; align-items:center; justify-content:center; margin:0; }
+  .card { text-align:center; max-width:420px; padding:32px; }
+  h1 { font-size:1.4rem; margin:0 0 8px; }
+  p  { color:#9aa0a6; font-size:.9rem; line-height:1.5; }
+  button { font-size:1.1rem; padding:14px 32px; border:0; border-radius:999px; cursor:pointer; background:#2e7d32; color:white; margin:18px 0; }
+  button.stop { background:#c62828; }
+  #status { font-size:1rem; min-height:1.5em; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#555; margin-right:8px; }
+  .listening .dot { background:#43a047; } .speaking .dot { background:#1e88e5; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Talk to the voice agent</h1>
+  <p>Uses your microphone and speakers. <b>Wear headphones</b> so the agent doesn't hear itself and interrupt.
+     Speak naturally; you can interrupt it mid-sentence.</p>
+  <button id="btn">Start call</button>
+  <div id="status"><span class="dot"></span><span id="statusText">Idle</span></div>
+</div>
+
+<script>
+// CODEC-START (G.711 mu-law, the audio format Twilio uses; 8 kHz, 1 byte per sample)
+function linearToMulaw(sample) {
+  const BIAS = 0x84, CLIP = 32635;
+  let sign = (sample >> 8) & 0x80;
+  if (sign) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; mask >>= 1) exponent--;
+  const mantissa = (sample >> (exponent + 3)) & 0x0F;
+  return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
+}
+function mulawToLinear(u) {
+  u = ~u & 0xFF;
+  const sign = u & 0x80, exponent = (u >> 4) & 0x07, mantissa = u & 0x0F;
+  const sample = ((mantissa << 3) + 0x84) << exponent;
+  return sign ? (0x84 - sample) : (sample - 0x84);
+}
+// CODEC-END
+
+const btn = document.getElementById("btn");
+const statusEl = document.getElementById("status");
+const statusText = document.getElementById("statusText");
+let ws = null, ctx = null, stream = null, node = null;
+let nextTime = 0, sources = [], speakingTimer = null;
+
+function setStatus(text, cls) { statusText.textContent = text; statusEl.className = cls || ""; }
+
+// ---- playback: queue agent audio back-to-back; "clear" (barge-in) stops everything queued
+function playMulaw(bytes) {
+  const buf = ctx.createBuffer(1, bytes.length, 8000);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bytes.length; i++) data[i] = mulawToLinear(bytes[i]) / 32768;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const t = Math.max(ctx.currentTime + 0.03, nextTime);
+  src.start(t);
+  nextTime = t + buf.duration;
+  sources.push(src);
+  src.onended = () => { sources = sources.filter(s => s !== src); };
+  setStatus("Agent speaking", "speaking");
+  clearTimeout(speakingTimer);
+  speakingTimer = setTimeout(() => setStatus("Listening...", "listening"),
+                             Math.max(0, (nextTime - ctx.currentTime) * 1000) + 200);
+}
+function clearPlayback() {
+  sources.forEach(s => { try { s.stop(); } catch (e) {} });
+  sources = [];
+  nextTime = 0;
+  setStatus("Listening...", "listening");
+}
+
+// ---- capture: microphone -> 8 kHz float samples -> 20 ms mu-law frames -> websocket
+const workletSrc = `
+class Cap extends AudioWorkletProcessor {
+  process(inputs) { const ch = inputs[0][0]; if (ch) this.port.postMessage(ch.slice(0)); return true; }
+}
+registerProcessor("cap", Cap);`;
+
+async function start() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+  // An 8 kHz context makes the browser resample the mic for us: no manual downsampling needed.
+  ctx = new AudioContext({ sampleRate: 8000 });
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletSrc], { type: "application/javascript" })));
+  node = new AudioWorkletNode(ctx, "cap");
+  ctx.createMediaStreamSource(stream).connect(node);
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/media`);
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ event: "start", start: { streamSid: "MZweb", callSid: "CAweb" } }));
+    setStatus("Connected, waiting for greeting...", "listening");
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.event === "media") {
+      const bin = atob(m.media.payload);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      playMulaw(bytes);
+    } else if (m.event === "clear") {
+      clearPlayback();
+    }
+  };
+  ws.onclose = () => { if (ctx) stop(); };
+
+  let pending = [];
+  node.port.onmessage = (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const f of e.data) {
+      const s = Math.max(-1, Math.min(1, f));
+      pending.push(linearToMulaw(Math.round(s * 32767)));
+    }
+    while (pending.length >= 160) {           // 160 samples = 20 ms at 8 kHz
+      const frame = pending.splice(0, 160);
+      ws.send(JSON.stringify({ event: "media", media: { payload: btoa(String.fromCharCode(...frame)) } }));
+    }
+  };
+
+  btn.textContent = "End call";
+  btn.className = "stop";
+}
+
+function stop() {
+  try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "stop" })); } catch (e) {}
+  try { ws && ws.close(); } catch (e) {}
+  clearPlayback();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  ws = ctx = stream = node = null;
+  btn.textContent = "Start call";
+  btn.className = "";
+  setStatus("Call ended. Transcript saved in data/transcripts.", "");
+}
+
+btn.onclick = async () => {
+  if (ws) { stop(); return; }
+  try { await start(); }
+  catch (err) { console.error(err); stop(); setStatus("Error: " + err.message, ""); }
+};
+</script>
+</body>
+</html>
