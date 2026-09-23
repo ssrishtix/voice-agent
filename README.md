@@ -1,6 +1,5 @@
 # CoolBreeze voice agent
 
-Demo video: (add link)
 
 Phone receptionist for an HVAC and plumbing shop. It listens, talks back, checks free slots in SQLite, and books a visit. It does **not** give appliance-repair instructions (washing machines, fridges, and so on).
 
